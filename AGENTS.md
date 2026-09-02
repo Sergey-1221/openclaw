@@ -21,6 +21,50 @@
   - Bundled plugin channels: the workspace plugin tree (for example Matrix, Zalo, ZaloUser, Voice Call)
 - When adding channels/plugins/apps/docs, update `.github/labeler.yml` and create matching GitHub labels (use existing channel/plugin label colors).
 
+## Paperclip integration (Avelton OS bridge)
+
+The fork bundles an integration with the Paperclip control plane — see
+the sibling repos `paperclip-avelton` (Paperclip fork, runs the
+endpoints) and `avelton-os` (installer that wires the env vars). All
+runtime modules live under `src/integrations/paperclip-*.ts`:
+
+- `paperclip-bootstrap.ts` — `startPaperclipIntegration()` is called
+  once on first successful gateway boot from
+  `src/cli/gateway-cli/run.ts`. It conditionally instantiates the five
+  Paperclip-facing clients based on env presence and returns a handle
+  with `stop()` for graceful shutdown.
+- `paperclip-heartbeat.ts` — periodic GET against Paperclip so
+  `agent_api_keys.last_used_at` shows green in the Paperclip UI.
+  Activated when `PAPERCLIP_BASE_URL` + `PAPERCLIP_AGENT_API_KEY` are
+  both set; the latter typically arrives via the Avelton OS shared-volume
+  entrypoint shim (see `avelton-os/internal/zones/templates/scripts`).
+- `paperclip-client.ts` — POSTs chat replies to Paperclip's
+  `/api/integrations/openclaw/inbound`. Includes a circuit breaker
+  (`paperclip-circuit.ts`) with the same closed/open/half_open state
+  machine as Paperclip's own openclaw-health on the opposite arrow.
+- `paperclip-dispatcher.ts` — convenience layer that turns a chat-layer
+  user reply into a `paperclip-client.postInbound` call. Available via
+  the bootstrap handle but **not** auto-wired into the chat reply
+  pipeline yet — channel-layer integration is a follow-up.
+- `paperclip-auth.ts` — Logto id_token → Paperclip bearer exchange via
+  `POST /api/auth/openclaw-exchange`. Cached per (id_token, companyId,
+  scopes) tuple to avoid re-mint on every MCP call.
+- `paperclip-mcp-client.ts` — JSON-RPC 2.0 client for Paperclip's MCP
+  endpoint (`/api/mcp`). Resolves the bearer per call: `ctx.bearer` →
+  `tokenProvider` → `cfg.apiKey` (legacy static-key path).
+- `paperclip-otel.ts` — optional OpenTelemetry/OTLP exporter. Activated
+  via `OTEL_EXPORTER_OTLP_ENDPOINT`. Uses dynamic imports so the
+  `@opentelemetry/*` packages stay optional peer deps.
+
+Env var compatibility with the Paperclip side is documented in
+`paperclip-avelton/.env.example` and `paperclip-avelton/CLAUDE.md`'s
+"Integration env" section. The shared bearers (`PAPERCLIP_INBOUND_TOKEN`,
+`OPENCLAW_EXCHANGE_CLIENT_SECRET`) and Logto JWKS URI are generated
+and injected by `avelton-os` so the bridge boots zero-touch.
+
+SIGTERM/SIGINT use `process.addListener` (not `once`) so we layer on
+top of any existing gateway-side handlers without displacing them.
+
 ## Architecture Boundaries
 
 - Start here for the repo map:

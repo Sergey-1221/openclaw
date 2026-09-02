@@ -537,18 +537,111 @@ async function runGatewayCommand(opts: GatewayRunOpts) {
       : undefined;
 
   gatewayLog.info("starting...");
+  // Activate the Paperclip integration once the gateway server is up.
+  // Heartbeat owns a setInterval timer; the rest of the clients are
+  // pure factories. Stored at module scope so the SIGTERM handler below
+  // can stop it cleanly.
+  const { startPaperclipIntegration } = await import(
+    "../../integrations/paperclip-bootstrap.js"
+  );
+  const { startPaperclipOtel, stopPaperclipOtel } = await import(
+    "../../integrations/paperclip-otel.js"
+  );
+  // OTEL has to start before the gateway server so auto-instrumentation
+  // hooks Express/HTTP at boot. Skipped silently when env doesn't opt in.
+  await startPaperclipOtel({ logger: gatewayLog });
+  let paperclipIntegration: ReturnType<typeof startPaperclipIntegration> | null = null;
+
   const startLoop = async () =>
     await runGatewayLoop({
       runtime: defaultRuntime,
       lockPort: port,
-      start: async ({ startupStartedAt } = {}) =>
-        await startGatewayServer(port, {
+      start: async ({ startupStartedAt } = {}) => {
+        const server = await startGatewayServer(port, {
           bind,
           auth: authOverride,
           tailscale: tailscaleOverride,
           startupStartedAt,
-        }),
+        });
+        if (!paperclipIntegration) {
+          paperclipIntegration = startPaperclipIntegration({ logger: gatewayLog });
+          const status = paperclipIntegration.describeStatus();
+          gatewayLog.info(`paperclip integration: ${paperclipIntegration.describe()}`);
+          // Critical-arrow check: outbound + dispatcher must be on for the
+          // bridge to serve its primary purpose (Paperclip → OpenClaw
+          // notifications and user-reply forwarding). A partial-env
+          // install where these are off in production is usually a
+          // missed env var, so emit a WARN. On development boxes this
+          // would be spam — downgrade to INFO there.
+          if (status.missingCritical.length > 0) {
+            const env = process.env.NODE_ENV ?? "development";
+            const msg = `paperclip integration missing critical arrows: ${status.missingCritical.join(", ")} (NODE_ENV=${env})`;
+            if (env === "production") {
+              gatewayLog.warn(msg);
+            } else {
+              gatewayLog.info(msg);
+            }
+          } else if (status.missingImportant.length > 0) {
+            gatewayLog.info(
+              `paperclip integration degraded — missing: ${status.missingImportant.join(", ")}`,
+            );
+          }
+        }
+        return server;
+      },
     });
+
+  // Use addListener (not once) so we don't displace any other SIGTERM /
+  // SIGINT handlers the gateway server already wired during startup —
+  // process.once with the same event would silently replace whichever
+  // listener lost the registration race.
+  //
+  // Shutdown ordering matters here, in this exact sequence:
+  //   1. drain in-flight dispatcher promises so their spans call .end()
+  //      and the audit-row inserts complete on the Paperclip side.
+  //      Without the drain, an in-flight maybeDispatchReplyToPaperclip
+  //      ends with recordException(SIGTERM) on the span and the matching
+  //      bridge_audit row never lands.
+  //   2. AWAIT stopPaperclipOtel() so the OTLP exporter flushes the
+  //      spans that drain just finalised. Previously this was
+  //      `void stopPaperclipOtel()` — fire-and-forget, which let the
+  //      handler return before the SDK shutdown promise resolved. Node
+  //      then exited (no other open handles) and pending exports were
+  //      dropped on the floor — operators saw incomplete traces in
+  //      Tempo with no clear cause.
+  //   3. integration.stop() to release timers (sync). Order vs OTel
+  //      doesn't matter strictly — stop() doesn't touch the tracer —
+  //      but doing it last keeps the "OTel sees the final span state"
+  //      invariant explicit.
+  //
+  // The 5s drain cap matches the typical kubelet
+  // terminationGracePeriodSeconds and is bounded so a slow Paperclip
+  // can't pin process teardown. OTel shutdown is unbounded — we trust
+  // the SDK's own internal timeout (default 30s) rather than wrapping
+  // it in another race; if the collector is unreachable, dropping the
+  // last batch of spans is acceptable. systemd / kubelet will SIGKILL
+  // us soon enough either way.
+  const stopBridge = () => {
+    void (async () => {
+      try {
+        await paperclipIntegration?.drain(5_000);
+      } catch {
+        // drain() promises never reject by contract, but defend
+        // against an unexpected throw — we'd rather complete teardown
+        // with a missing audit row than hang on a buggy drain.
+      }
+      try {
+        await stopPaperclipOtel();
+      } catch {
+        // stopPaperclipOtel() already swallows internal errors; this
+        // catch is just belt-and-braces for an unexpected throw at
+        // the await boundary so the rest of teardown still runs.
+      }
+      paperclipIntegration?.stop();
+    })();
+  };
+  process.addListener("SIGTERM", stopBridge);
+  process.addListener("SIGINT", stopBridge);
 
   try {
     const supervisor = detectRespawnSupervisor(process.env);

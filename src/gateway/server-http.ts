@@ -71,6 +71,8 @@ import {
 import type { PreauthConnectionBudget } from "./server/preauth-connection-budget.js";
 import type { ReadinessChecker } from "./server/readiness.js";
 import type { GatewayWsClient } from "./server/ws-types.js";
+import { getActivePaperclipIntegration } from "../integrations/paperclip-bootstrap.js";
+import { getActivePaperclipMetrics } from "../integrations/paperclip-metrics.js";
 
 type SubsystemLogger = ReturnType<typeof createSubsystemLogger>;
 
@@ -189,6 +191,90 @@ const GATEWAY_PROBE_STATUS_BY_PATH = new Map<string, "live" | "ready">([
   ["/ready", "ready"],
   ["/readyz", "ready"],
 ]);
+
+// Surfaces the active Paperclip integration's circuit-breaker state
+// alongside the liveness probe so avelton-os can render a symmetric
+// view of both arrows. Returns null when the integration isn't wired
+// (env-disabled).
+//
+// Shape extension:
+//   - `circuit` — legacy outbound snapshot, kept for older dashboards
+//   - `circuits` — per-arrow map (outbound|auth|mcp) so k8s probes see
+//     the full breaker trio without having to scrape /metrics
+//   - `heartbeat.consecutiveFailures` — mirror of the Prometheus gauge
+//     so operators can read it from /health when the collector is down
+function getPaperclipHealthBlock(): {
+  circuit: unknown;
+  circuits: unknown;
+  heartbeat: { consecutiveFailures: number } | null;
+} | null {
+  const integration = getActivePaperclipIntegration();
+  if (!integration) return null;
+  const circuit = integration.circuitSnapshot();
+  if (!circuit) return null;
+  const snapshots = integration.circuitSnapshots();
+  // Read heartbeat via the metrics collector rather than poking into
+  // the heartbeat module's state so this block stays decoupled from
+  // heartbeat internals. Null when the metrics collector isn't wired
+  // (integration env-disabled); in practice this branch is unreachable
+  // because circuit!=null implies integration is active.
+  const metrics = getActivePaperclipMetrics();
+  const heartbeat = metrics
+    ? { consecutiveFailures: metrics.getHeartbeatConsecutiveFailures() }
+    : null;
+  return { circuit, circuits: snapshots, heartbeat };
+}
+
+// Renders Prometheus text exposition for the Paperclip-facing bridge
+// when the /metrics path is requested. Symmetric with paperclip-avelton's
+// /api/metrics endpoint so the collector can scrape both arrows.
+//
+// Unauthenticated by design: the endpoint is reachable only from the
+// internal docker network (avelton-os's otel-collector is on the same
+// compose network and scrapes directly by service name). If you expose
+// this gateway to a public perimeter, add an auth gate or route-level
+// network policy — do NOT remove auth here expecting it to be elsewhere.
+async function handleMetricsRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  requestPath: string,
+): Promise<boolean> {
+  if (requestPath !== "/metrics") return false;
+  const method = (req.method ?? "GET").toUpperCase();
+  if (method !== "GET" && method !== "HEAD") {
+    res.statusCode = 405;
+    res.setHeader("Allow", "GET, HEAD");
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.end("Method Not Allowed");
+    return true;
+  }
+  res.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
+  const metrics = getActivePaperclipMetrics();
+  if (!metrics) {
+    // Still emit a valid empty exposition so the collector's scrape
+    // doesn't go red on freshly-installed boxes where the Paperclip
+    // integration isn't yet wired.
+    res.statusCode = 200;
+    res.end(method === "HEAD" ? undefined : "# Paperclip integration not initialised\n");
+    return true;
+  }
+  const integration = getActivePaperclipIntegration();
+  // Three named arrows: outbound (postInbound), auth (exchange), mcp
+  // (JSON-RPC). The metrics renderer emits a gauge per arrow so a
+  // single Grafana panel can plot all three side-by-side and spot which
+  // direction tripped when a bridge goes yellow.
+  const body = integration
+    ? metrics.renderExposition([
+        { arrow: "paperclip_outbound", get: () => integration.circuitSnapshots().outbound },
+        { arrow: "paperclip_auth", get: () => integration.circuitSnapshots().auth },
+        { arrow: "paperclip_mcp", get: () => integration.circuitSnapshots().mcp },
+      ])
+    : metrics.renderExposition();
+  res.statusCode = 200;
+  res.end(method === "HEAD" ? undefined : body);
+  return true;
+}
 async function resolvePluginGatewayAuthBypassPaths(
   configSnapshot: OpenClawConfig,
 ): Promise<Set<string>> {
@@ -317,7 +403,8 @@ async function handleGatewayProbeRequest(
     }
   } else {
     statusCode = 200;
-    body = JSON.stringify({ ok: true, status });
+    const paperclip = getPaperclipHealthBlock();
+    body = JSON.stringify(paperclip ? { ok: true, status, paperclip } : { ok: true, status });
   }
   res.statusCode = statusCode;
   res.end(method === "HEAD" ? undefined : body);
@@ -636,7 +723,12 @@ export function createHooksRequestHandler(
       return true;
     }
 
-    if (subPath === "agent") {
+    // The `paperclip` alias is a semantic label for payloads that originated
+    // on the Paperclip side of the bridge. Dispatch is identical to /agent;
+    // Avelton OS renders OPENCLAW_HOOKS_URL=…/hooks/paperclip so inbound
+    // provenance is unambiguous in logs. Old deployments pointing at
+    // /hooks/agent keep working unchanged.
+    if (subPath === "agent" || subPath === "paperclip") {
       const normalized = normalizeAgentPayload(payload as Record<string, unknown>);
       if (!normalized.ok) {
         sendJson(res, 400, { ok: false, error: normalized.error });
@@ -900,6 +992,14 @@ export function createGatewayHttpServer(opts: {
         {
           name: "hooks",
           run: () => handleHooksRequest(req, res),
+        },
+        // `/metrics` is registered before plugin stages so no
+        // operator-installed route can shadow it. Internal-only (see
+        // handleMetricsRequest docstring); the handler no-ops for any
+        // non-/metrics path so this doesn't add per-request overhead.
+        {
+          name: "gateway-metrics",
+          run: () => handleMetricsRequest(req, res, requestPath),
         },
       ];
       if (openAiCompatEnabled && isOpenAiModelsPath(requestPath)) {

@@ -21,6 +21,7 @@ import { normalizeInputProvenance, type InputProvenance } from "../../sessions/i
 import { resolveSendPolicy } from "../../sessions/send-policy.js";
 import { parseAgentSessionKey } from "../../sessions/session-key-utils.js";
 import { emitSessionTranscriptUpdate } from "../../sessions/transcript-events.js";
+import { maybeDispatchReplyToPaperclip } from "../../integrations/paperclip-bootstrap.js";
 import {
   parseAssistantTextSignature,
   resolveAssistantMessagePhase,
@@ -1850,6 +1851,23 @@ export const chatHandlers: GatewayRequestHandlers = {
     });
     const now = Date.now();
     const clientRunId = p.idempotencyKey;
+
+    // Fire-and-forget mirror of this reply into Paperclip. The helper
+    // handles the `paperclip:` prefix guard, the singleton lookup, and
+    // swallows throws so a misconfigured bridge can't fail the
+    // user-facing send. No await: the forward runs concurrently with
+    // the rest of the chat.send flow so we don't add latency to the
+    // user's reply path.
+    void maybeDispatchReplyToPaperclip(
+      {
+        sessionKey,
+        message: inboundMessage,
+        idempotencyKey: clientRunId,
+      },
+      {
+        warn: (msg) => context.logGateway?.warn(msg),
+      },
+    );
 
     const sendPolicy = resolveSendPolicy({
       cfg,
